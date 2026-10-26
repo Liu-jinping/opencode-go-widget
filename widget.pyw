@@ -59,7 +59,9 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 LOG_PATH = os.path.join(APP_DIR, "widget.log")
 API_URL = "https://opencode.ai/zen/go/v1/usage"
-HTTP_TIMEOUT = 15  # 秒
+HTTP_TIMEOUT = 10  # 单次请求超时（秒）；网络类失败会自动重试一次
+HTTP_RETRIES = 2   # 网络类失败的总尝试次数
+REFRESH_WATCHDOG = 45  # 单轮刷新最长时间，超过则强制复位（防 getaddrinfo 卡死）
 MIN_INTERVAL = 10  # 最小刷新间隔（秒）
 
 # 认证文件候选位置（opencode 默认 ~/.local/share/opencode/auth.json）
@@ -272,8 +274,8 @@ class UsageError(Exception):
         self.short = short
 
 
-def fetch_usage(token):
-    """请求额度接口，返回 usage 字典；失败抛 UsageError。"""
+def _fetch_once(token):
+    """单次请求额度接口，返回 usage 字典；失败抛 UsageError。"""
     req = urllib.request.Request(
         API_URL,
         headers={
@@ -310,6 +312,22 @@ def fetch_usage(token):
     if not isinstance(usage, dict):
         raise UsageError("返回数据缺少 usage 字段", "数据异常")
     return usage
+
+
+def fetch_usage(token):
+    """请求额度接口；网络类失败自动重试，避免一次握手抖动就把界面打成红色。"""
+    last = None
+    for attempt in range(1, HTTP_RETRIES + 1):
+        try:
+            return _fetch_once(token)
+        except UsageError as exc:
+            last = exc
+            retryable = exc.short in ("网络失败", "网络超时") or exc.short.startswith("HTTP 5")
+            if not retryable or attempt >= HTTP_RETRIES:
+                raise
+            log("第 %d 次请求失败（%s），%.1f 秒后重试" % (attempt, exc.short, 0.8 * attempt))
+            time.sleep(0.8 * attempt)
+    raise last
 
 
 def format_resets(value):
@@ -1034,6 +1052,7 @@ class Widget:
         self.opacity = self.config["opacity"]
         self.width = self.config["width"]
         self.busy = False
+        self.busy_since = 0.0      # 本轮请求开始时间（看门狗用）
         self.topmost = True
         self.hidden = False
         self.last_error = ""
@@ -2084,6 +2103,7 @@ class Widget:
         if self.busy:
             return
         self.busy = True
+        self.busy_since = time.monotonic()
         self._draw_dot(C_DOT_BUSY)
         self.status_lbl.configure(text="正在更新…", fg=C_SUB)
         threading.Thread(target=self._worker, daemon=True).start()
@@ -2107,13 +2127,32 @@ class Widget:
         self.results.put(payload)
 
     def _poll_results(self):
-        self._drain_tray()          # 托盘的显示/隐藏、菜单、刷新请求
+        try:
+            self._drain_tray()      # 托盘的显示/隐藏、菜单、刷新请求
+        except Exception:
+            log("托盘消息处理异常：\n" + traceback.format_exc())
         try:
             while True:
                 payload = self.results.get_nowait()
-                self._apply(payload)
+                try:
+                    self._apply(payload)
+                except Exception:
+                    log("界面刷新异常：\n" + traceback.format_exc())
+                    self.busy = False
         except queue.Empty:
             pass
+        # 看门狗：DNS 解析或 TLS 握手挂住时（socket 超时管不到 getaddrinfo），
+        # 不能让 busy 永远为 True，否则之后所有刷新都会被跳过、界面停在旧错误上。
+        if self.busy and time.monotonic() - self.busy_since > REFRESH_WATCHDOG:
+            log("请求超过 %d 秒未返回，强制复位等待状态" % REFRESH_WATCHDOG)
+            self.busy = False
+            for row in self.rows:
+                row.set_error("请求超时")
+            self._draw_dot(C_ERR)
+            self.status_lbl.configure(text="更新失败 · 请求超时，稍后自动重试", fg=C_ERR)
+            self.ring_state = "error"
+            self._draw_ring()
+            self._draw_compact()
         self.root.after(150, self._poll_results)
 
     def _tooltip_text(self, payload):
@@ -2163,12 +2202,21 @@ class Widget:
         self._draw_ring()           # 左右圆环条立刻跟上最新数据 / 错误态
         self._draw_compact()        # 小窗模式 / 顶部小条的三段横条同样刷新
         if self.tray is not None:
-            self.tray.set_tip(self._tooltip_text(payload))   # 只改 szTip，不重建图标
+            try:
+                self.tray.set_tip(self._tooltip_text(payload))   # 只改 szTip，不重建图标
+            except Exception:
+                log("托盘提示更新失败：\n" + traceback.format_exc())
         self.busy = False
 
     def _auto_refresh(self):
-        self.refresh()
-        self.root.after(self.interval * 1000, self._auto_refresh)
+        try:
+            self.refresh()
+        except Exception:
+            log("自动刷新异常：\n" + traceback.format_exc())
+        try:
+            self.root.after(self.interval * 1000, self._auto_refresh)
+        except tk.TclError:
+            pass
 
     # -- 启动 ---------------------------------------------------------------
     def start(self):
