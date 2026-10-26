@@ -7,14 +7,20 @@ opencode go 订阅额度悬浮小组件
 - 无边框、置顶、可拖动的小窗，圆角白卡片 + 灰色描边观感
 - 三行额度（Rolling / Weekly / Monthly）：标题 + 绿色百分比徽标 + Resets in + 灰底绿条进度
 - 60 秒自动轮询（可在 config.json 中修改），后台线程请求，主线程更新界面
-- 左键拖动移动，单击刷新，右键菜单：刷新 / 置顶 / 隐藏窗口 / 贴边自动收缩 / 透明度 / 退出
+- 左键拖动移动，单击刷新，右键菜单：刷新 / 置顶 / 隐藏窗口 / 贴边自动收缩 / 小窗模式 / 透明度 / 退出
 - 透明度可调（100%~50%），写回 config.json 的 opacity 字段持久化
 - 右侧 8px 隐形抓柄可左右拖改宽度（280~640），双击抓柄恢复默认，写回 width 字段
+- 小窗模式（mode=compact）：紧凑横条，三等分段显示 5h / 周 / 月 的**剩余**额度
+  （上行百分比 + 档位名，下行细横条柱状图），固定 300×45；
+  右键菜单可开关，写回 config.json 的 mode 字段（默认 full）
+- 拖动边界：窗口永远拖不出虚拟屏（多显示器用 GetSystemMetrics 的
+  SM_XVIRTUALSCREEN 系列判定，左/上到边即停，右/下也不许越界）
 - 系统托盘（通知区域）常驻：ctypes Shell_NotifyIcon + 系统默认图标 LoadIcon(IDI_APPLICATION)，
   不占任务栏；左键单击 / 双击切换显示隐藏，右键菜单：显示/隐藏 · 立即刷新 · 退出；
   每次轮询后更新 tooltip（64 字内，不重建图标），失败时显示错误简称
-- 贴边自动收缩：拖到屏幕左右边缘（8px 内松手）吸附成约 36px 宽的圆环条，
-  环形进度显示 Rolling（5 小时）剩余额度；悬停滑出完整面板，离开 800ms 后自动收回；
+- 贴边自动收缩：拖到屏幕边缘（8px 内松手）吸附，判定顺序 **上 -> 左 -> 右**：
+  左右吸附成约 36px 宽的圆环条（显示 Rolling 剩余额度），上边吸附成贴顶悬浮小条
+  （内容为小窗模式的三段横条）；悬停滑出完整面板，离开 800ms 后自动收回；拖离边缘恢复正常尺寸；
   右键菜单可开关，写回 config.json 的 edge_dock 字段（默认 true）
 
 启动方式：双击 widget.pyw 或运行 opencode-widget.bat
@@ -102,6 +108,20 @@ EDGE_H = 44            # 收缩后圆环条高度
 EDGE_THRESHOLD = 8     # 判定「贴边」的吸附阈值（逻辑像素）
 EDGE_LEAVE_MS = 800    # 鼠标离开面板后自动收回的延时（毫秒）
 
+# 小窗模式（横向一排三档剩余额度：文字行 + 细横条柱状图）
+MODE_FULL = "full"        # 标准模式：三行 + 状态栏
+MODE_COMPACT = "compact"  # 小窗模式：三等分段「百分比 + 档位 + 横条」
+COMPACT_W = 300           # 小窗模式宽度（逻辑像素，固定 290~320 区间）
+COMPACT_H = 45            # 小窗模式高度（逻辑像素，固定 42~48 区间）
+COMPACT_LABELS = ("5h", "周", "月")   # 与托盘 tooltip 的三个档位一致
+COMPACT_SEP = "#e6e6e6"   # 段间 1px 浅灰竖分隔线
+COMPACT_SEP_PAD = 8       # 分隔线上下留白
+COMPACT_PAD = 9           # 段内左右内边距（横条按段宽自适应）
+COMPACT_TEXT_CY = 17      # 第一行（百分比 + 档位）的垂直中心
+COMPACT_TEXT_GAP = 6      # 百分比与档位名之间的间距
+COMPACT_BAR_Y = 30        # 第二行横条顶部
+COMPACT_BAR_H = 5         # 横条高度
+
 # 透明度（越界自动钳制到 0.5~1.0）
 OPACITY_STEPS = (1.0, 0.9, 0.8, 0.7, 0.6, 0.5)
 OPACITY_MIN = 0.5
@@ -125,6 +145,9 @@ FONT_MENU = ("Microsoft YaHei UI", 9)
 FONT_RING = ("Segoe UI", 7, "bold")
 FONT_RING_SM = ("Segoe UI", 6, "bold")
 FONT_RING_XS = ("Segoe UI", 5, "bold")
+# 小窗模式第一行：百分比（深色 10pt 半粗）+ 档位名（灰 9pt）
+FONT_COMPACT_NUM = ("Segoe UI", 10, "bold")
+FONT_COMPACT_TAG = ("Microsoft YaHei UI", 9)
 
 
 # ---------------------------------------------------------------------------
@@ -177,12 +200,16 @@ def load_config():
         edge_dock = edge_raw.strip().lower() not in ("0", "false", "no", "off", "")
     else:
         edge_dock = bool(edge_raw)
+    mode = str(cfg.get("mode") or MODE_FULL).strip().lower()
+    if mode != MODE_COMPACT:
+        mode = MODE_FULL          # 老配置没有 mode，或值非法，一律按标准模式
     return {
         "token": token,
         "interval": interval,
         "opacity": opacity,
         "width": width,
         "edge_dock": edge_dock,
+        "mode": mode,
     }
 
 
@@ -824,6 +851,28 @@ def round_rect(canvas, x1, y1, x2, y2, radius, **kw):
     return canvas.create_polygon(points, smooth=True, **kw)
 
 
+def round_rect_top_flat(canvas, x1, y1, x2, y2, radius, **kw):
+    """
+    上边两个角为直角、下边两个角为圆角的形状。
+    贴顶吸附时用：顶边与屏幕边缘齐平，只保留底部圆角，看起来才像「吸附」而不是浮着。
+    """
+    r = max(0, min(radius, (x2 - x1) / 2.0, (y2 - y1) / 2.0))
+    if r <= 0:
+        return canvas.create_rectangle(x1, y1, x2, y2, **kw)
+    points = [
+        x1, y1, x1, y1,            # 左上：重复点把样条锚成直角
+        x2, y1, x2, y1,            # 右上：同上
+        x2, y2 - r,
+        x2, y2,
+        x2 - r, y2,                # 右下圆角
+        x1 + r, y2,
+        x1, y2,                    # 左下圆角
+        x1, y2 - r,
+        x1, y1, x1, y1,            # 收口
+    ]
+    return canvas.create_polygon(points, smooth=True, **kw)
+
+
 # ---------------------------------------------------------------------------
 # 单行组件
 # ---------------------------------------------------------------------------
@@ -965,6 +1014,10 @@ def fonts_build(root):
     _FONTS["ring"] = tkfont.Font(root, family=FONT_RING[0], size=FONT_RING[1], weight="bold")
     _FONTS["ring_sm"] = tkfont.Font(root, family=FONT_RING_SM[0], size=FONT_RING_SM[1], weight="bold")
     _FONTS["ring_xs"] = tkfont.Font(root, family=FONT_RING_XS[0], size=FONT_RING_XS[1], weight="bold")
+    _FONTS["cnum"] = tkfont.Font(
+        root, family=FONT_COMPACT_NUM[0], size=FONT_COMPACT_NUM[1], weight="bold"
+    )
+    _FONTS["ctag"] = tkfont.Font(root, family=FONT_COMPACT_TAG[0], size=FONT_COMPACT_TAG[1])
 
 
 # ---------------------------------------------------------------------------
@@ -988,6 +1041,9 @@ class Widget:
         self.drag_origin = None
         self.win_origin = None
         self.moved = False
+        # 显示模式：full = 三行完整面板，compact = 三段横条紧凑小窗
+        self.mode = self.config["mode"]
+        self.compact = self.mode == MODE_COMPACT
         # 宽度抓柄状态
         self.resize_origin = None
         self.press_width = self.width
@@ -995,13 +1051,13 @@ class Widget:
         self.grip_cursor = ""
         # 贴边收缩状态
         self.edge_dock = self.config["edge_dock"]
-        self.docked = None              # None / "left" / "right"
+        self.docked = None              # None / "left" / "right" / "top"
         self.hover_expanded = False     # 收缩后因悬停展开中
-        self.hover_armed = True         # 指针离开圆环条后才允许再次展开
+        self.hover_armed = True         # 指针离开收缩条后才允许再次展开
         self.leave_deadline = None      # 离开面板后自动收回的截止时刻
         # 托盘状态
         self.tray = None
-        self.ring_state = "busy"        # busy / ok / error
+        self.ring_state = "busy"        # busy / ok / error（左右圆环条）
         self.ring_used = 0
 
         # 高分屏缩放比例（96 DPI 为 1.0）
@@ -1017,9 +1073,11 @@ class Widget:
         self._build_background()
         self._build_rows()
         self._build_status()
+        self._build_compact()
         self._build_menu()
         self._bind_pointer(root)
         self._build_ring()
+        self._relayout()              # 按启动时的模式决定初始形态（标准 / 小窗）
         self.tray = self._create_tray()   # 启动即驻留系统托盘
 
     # -- 窗口 ---------------------------------------------------------------
@@ -1040,12 +1098,11 @@ class Widget:
         root.attributes("-topmost", self.topmost)
         root.configure(bg=TRANSPARENT_COLOR if self.transparent_ok else C_BORDER)
 
-        width = self.s(self.width)
-        height = self.s(H)
-        screen_w = root.winfo_screenwidth()
-        screen_h = root.winfo_screenheight()
-        x = max(0, screen_w - width - int(28 * self.scale))
-        y = max(0, int(screen_h * 0.10))
+        width, height = self._panel_px_size()
+        vx0, vy0, vw, vh = self._virtual_screen()
+        x = vx0 + vw - width - int(28 * self.scale)
+        y = vy0 + int(vh * 0.10)
+        x, y = self._clamp_pos(x, y, width, height)
         root.geometry("%dx%d+%d+%d" % (width, height, x, y))
 
     def _build_background(self):
@@ -1123,6 +1180,122 @@ class Widget:
         pad = self.s(1)
         c.create_oval(pad, pad, self.s(9) - pad, self.s(9) - pad, fill=color, outline="")
 
+    def _build_compact(self):
+        """小窗模式 / 顶部小条：三段「百分比 + 档位 + 横条」的画布（卡片背景自己画）。"""
+        s = self.s
+        canvas = tk.Canvas(
+            self.root,
+            width=s(COMPACT_W),
+            height=s(COMPACT_H),
+            bg=TRANSPARENT_COLOR if self.transparent_ok else C_BORDER,
+            highlightthickness=0,
+            bd=0,
+        )
+        canvas.place(x=0, y=0, width=s(COMPACT_W), height=s(COMPACT_H))
+        canvas.place_forget()
+        # place / 模式切换都会改变尺寸，交给 Configure 重绘，保证拿到真实宽高
+        canvas.bind("<Configure>", self._draw_compact, add="+")
+        self.compact_canvas = canvas
+        self._draw_compact()
+
+    def _fit_ring_font(self, text, inner_px):
+        """按可用内径挑选字号，保证 “100%” 也不会撑出圆环。"""
+        font = _FONTS["ring_xs"]
+        for name in ("ring", "ring_sm", "ring_xs"):
+            font = _FONTS[name]
+            if font.measure(text) <= inner_px:
+                break
+        return font
+
+    def _draw_compact(self, _event=None):
+        """
+        小窗模式 / 顶部小条：三等分段横向排列，段间 1px 浅灰竖分隔线。
+
+        每段两行：
+          上行  「剩余百分比 + 档位名」，如 `98% 5h`（百分比深色 10pt 半粗，档位灰 9pt）
+          下行  一根细横条，长度 = 该档**剩余**百分比（100% 填满、0% 为空）
+        错误档：整段文字变红、横条变红（浅红底）。
+        """
+        canvas = self.compact_canvas
+        canvas.delete("all")
+        w = canvas.winfo_width()
+        h = canvas.winfo_height()
+        if w < 16 or h < 16:
+            return
+        s = self.s
+        # 贴顶吸附时顶部两角画成直角，与屏幕边缘严丝合缝
+        top_flat = self.docked == "top" and not self.hover_expanded
+        shape = round_rect_top_flat if top_flat else round_rect
+        shape(
+            canvas, 0.5, 0.5, w - 1.0, h - 1.0, s(R),
+            fill=C_BG, outline=C_BORDER, width=max(1, s(1)),
+        )
+        seg_w = w / 3.0
+        pad = s(COMPACT_PAD)
+        gap = s(COMPACT_TEXT_GAP)
+        text_y = s(COMPACT_TEXT_CY)
+        bar_y = s(COMPACT_BAR_Y)
+        bar_h = max(3, s(COMPACT_BAR_H))
+        # 段间 1px 浅灰竖分隔线（上下留白，不顶到卡片边）
+        sep_top = s(COMPACT_SEP_PAD)
+        sep_bot = h - s(COMPACT_SEP_PAD)
+        for i in (1, 2):
+            x = seg_w * i
+            canvas.create_line(x, sep_top, x, sep_bot, fill=COMPACT_SEP, width=1)
+
+        for i, tag in enumerate(COMPACT_LABELS):
+            x0 = seg_w * i
+            cx = x0 + seg_w / 2.0
+            row = self.rows[i] if i < len(self.rows) else None
+            state = row.state if row is not None else "busy"
+            used = int(row.percent) if row is not None else 0
+            remaining = max(0, min(100, 100 - used))
+            if state == "ok":
+                num = "%d%%" % remaining
+                num_color = C_TEXT
+                tag_color = C_SUB
+                track, fill = C_TRACK, C_GREEN
+            elif state == "error":
+                num = "—"
+                num_color = tag_color = C_ERR
+                track, fill = C_ERR_BG, C_ERR      # 浅红底 + 红条
+                remaining = 100
+            else:
+                num = "—"
+                num_color = tag_color = C_SUB
+                track, fill = C_TRACK, None
+                remaining = 0
+
+            # 上行：百分比 + 档位名，整组在段内居中
+            w_num = _FONTS["cnum"].measure(num)
+            w_tag = _FONTS["ctag"].measure(tag)
+            left = cx - (w_num + gap + w_tag) / 2.0
+            canvas.create_text(
+                left + w_num / 2.0, text_y, text=num,
+                font=_FONTS["cnum"], fill=num_color, anchor="center",
+            )
+            canvas.create_text(
+                left + w_num + gap + w_tag / 2.0, text_y, text=tag,
+                font=_FONTS["ctag"], fill=tag_color, anchor="center",
+            )
+
+            # 下行：细横条，长度 = 剩余百分比（100% 填满、0% 为空）
+            bx0, bx1 = x0 + pad, x0 + seg_w - pad
+            bw = bx1 - bx0
+            if bw < 4:
+                continue
+            round_rect(
+                canvas, bx0, bar_y, bx1, bar_y + bar_h, bar_h / 2.0,
+                fill=track, outline="",
+            )
+            if fill is not None and remaining > 0:
+                fw = bw * remaining / 100.0
+                fw = min(bw, max(fw, float(bar_h)))   # 有剩余就至少露出一个圆头
+                round_rect(
+                    canvas, bx0, bar_y, bx0 + fw, bar_y + bar_h, bar_h / 2.0,
+                    fill=fill, outline="",
+                )
+
     def _build_menu(self):
         menu = tk.Menu(
             self.root,
@@ -1145,6 +1318,14 @@ class Widget:
             label="贴边自动收缩",
             variable=self.edge_var,
             command=self.toggle_edge_dock,
+        )
+
+        # 小窗模式开关（索引 4），勾选状态写回 config.json 的 mode
+        self.mode_var = tk.BooleanVar(value=self.compact)
+        menu.add_checkbutton(
+            label="小窗模式",
+            variable=self.mode_var,
+            command=self.toggle_compact,
         )
 
         # 透明度级联子菜单：勾选当前值
@@ -1192,6 +1373,8 @@ class Widget:
 
     def _in_grip(self, event):
         """事件是否落在窗口右侧约 8px 的隐形抓柄上。"""
+        if self.compact:
+            return False   # 小窗模式固定宽度，没有抓柄
         if self.docked is not None:
             return False   # 收缩态没有抓柄
         try:
@@ -1261,13 +1444,17 @@ class Widget:
             log("drag start dx=%d dy=%d scale=%.2f" % (dx, dy, self.scale))
         self.moved = True
         if self.docked is not None and not self.hover_expanded:
-            # 按住圆环条拖动：先滑出完整面板，再从当前位置继续拖，避免跳位
+            # 按住收缩条拖动：先滑出面板，再从当前位置继续拖，避免跳位
             self._expand_dock()
             self.drag_origin = (event.x_root, event.y_root)
             self.win_origin = (self.root.winfo_x(), self.root.winfo_y())
             dx = dy = 0
         x = self.win_origin[0] + dx
         y = self.win_origin[1] + dy
+        # 拖动边界：不许拖出虚拟屏（左/上到边即停，右/下也不越界）
+        px_w = self.root.winfo_width() or self.s(self.width)
+        px_h = self.root.winfo_height() or self.s(H)
+        x, y = self._clamp_pos(x, y, px_w, px_h)
         self.root.geometry("+%d+%d" % (x, y))
 
     def _on_release(self, _event):
@@ -1316,44 +1503,65 @@ class Widget:
 
     def _set_width(self, logical_width):
         """按逻辑像素调整窗口宽度（高度不变），并重排内容。"""
+        if self.compact:
+            return                      # 小窗模式固定宽度（300），改宽请切回标准模式
         if self.docked is not None and not self.hover_expanded:
-            return                      # 收缩态（圆环条）不改宽度
+            return                      # 收缩态（圆环条 / 顶部小条）不改宽度
         width = int(round(clamp_number(logical_width, W_MIN, W_MAX, float(W))))
         if width == self.width:
             return
         self.width = width
         px_width = self.s(width)
-        x = self.root.winfo_x()
         y = self.root.winfo_y()
+        vx0, _vy0, vw, vh = self._virtual_screen()
         # 右侧留出抓柄余量，超出虚拟屏时把窗口往左挪，保证抓柄始终够得着
-        try:
-            vroot_x = self.root.winfo_vrootx()
-            vroot_width = self.root.winfo_vrootwidth()
-        except tk.TclError:
-            vroot_x, vroot_width = 0, self.root.winfo_screenwidth()
-        max_x = vroot_x + vroot_width - px_width - self.s(GRIP_W + 8)
-        if x > max_x:
-            x = max(vroot_x, max_x)
+        max_x = vx0 + vw - px_width - self.s(GRIP_W + 8)
+        x = min(self.root.winfo_x(), max(vx0, max_x))
         if self.docked == "right":
-            x = vroot_x + vroot_width - px_width    # 悬停展开时改宽也要贴住右边缘
+            x = vx0 + vw - px_width     # 悬停展开时改宽也要贴住右边缘
         elif self.docked == "left":
-            x = vroot_x
-        height = self.root.winfo_height() or self.s(H)
-        self.root.geometry("%dx%d+%d+%d" % (px_width, height, x, y))
+            x = vx0
+        elif self.docked == "top":
+            # 顶部小条水平保持原中心，始终贴住上边缘
+            cx = self.root.winfo_x() + (self.root.winfo_width() or px_width) // 2
+            x = cx - px_width // 2
+            y = _vy0
+        x, y = self._clamp_pos(x, y, px_width, self.root.winfo_height() or self.s(H))
+        self.root.geometry("%dx%d+%d+%d" % (px_width, self.root.winfo_height() or self.s(H), x, y))
         self._relayout()
 
     def _relayout(self):
-        """宽度变化后重排：完整面板与收缩圆环条两种布局。"""
-        if self.docked is None or self.hover_expanded:
-            self._layout_panel()
+        """
+        按当前状态重排，四种形态：
+        1. 未吸附 + 标准模式  -> 完整三行面板
+        2. 未吸附 + 小窗模式  -> 三段横条紧凑小窗
+        3. 左右吸附           -> 36px 圆环条（悬停展开为 1/2 的面板）
+        4. 上边吸附           -> 顶部小条（三段横条，悬停展开为 1/2 的面板）
+        """
+        if self.docked is not None and not self.hover_expanded:
+            if self.docked == "top":
+                self._layout_topbar()
+            else:
+                self._layout_dock()
         else:
-            self._layout_dock()
+            self._layout_panel()
+
+    def _hide_all_layers(self):
+        """先全部收起，再按需要显示的层逐个摆放。"""
+        for widget in (self.bg_canvas, self.row_holder, self.status_frame,
+                       self.ring_canvas, self.compact_canvas):
+            widget.place_forget()
 
     def _layout_panel(self):
-        """完整面板布局：卡片 + 三行 + 状态栏（收缩态 place_forget 过，这里全部重摆）。"""
+        """展开态布局：标准 = 卡片 + 三行 + 状态栏；小窗 = 三段横条紧凑小窗。"""
         s = self.s
+        self._hide_all_layers()
+        if self.compact:
+            self.compact_canvas.place(x=0, y=0, width=s(COMPACT_W), height=s(COMPACT_H))
+            self.root.update_idletasks()
+            self._draw_compact()
+            return
         inner = self.width - PAD * 2
-        self.ring_canvas.place_forget()
         self.bg_canvas.place(x=0, y=0, width=s(self.width), height=s(H))
         self.row_holder.place(
             x=s(PAD),
@@ -1369,14 +1577,20 @@ class Widget:
         self._draw_background()
 
     def _layout_dock(self):
-        """收缩态布局：只留下 36px 宽的圆环条。"""
+        """左右吸附的收缩态：只留下 36px 宽的圆环条。"""
         s = self.s
-        self.bg_canvas.place_forget()
-        self.row_holder.place_forget()
-        self.status_frame.place_forget()
+        self._hide_all_layers()
         self.ring_canvas.place(x=0, y=0, width=s(EDGE_W), height=s(EDGE_H))
         self.root.update_idletasks()      # 让圆环立刻拿到真实宽高并完成绘制
         self._draw_ring()
+
+    def _layout_topbar(self):
+        """上边吸附的收缩态：贴顶的悬浮小条，内容是三段横条（顶部平角）。"""
+        s = self.s
+        self._hide_all_layers()
+        self.compact_canvas.place(x=0, y=0, width=s(COMPACT_W), height=s(COMPACT_H))
+        self.root.update_idletasks()
+        self._draw_compact()
 
     # -- 显示 / 隐藏（配合托盘图标） ---------------------------------------
     def hide_window(self):
@@ -1440,120 +1654,232 @@ class Widget:
         if not self.edge_dock and self.docked is not None:
             self._undock()
 
+    # -- 显示模式（标准 / 小窗） ---------------------------------------------
+    def toggle_compact(self):
+        """右键菜单里的「小窗模式」开关，写回 config.json 的 mode。"""
+        self.compact = not self.compact
+        self.mode = MODE_COMPACT if self.compact else MODE_FULL
+        self.mode_var.set(self.compact)
+        save_config({"mode": self.mode})
+        self._switch_mode()
+        if os.environ.get("OPENCODE_WIDGET_DEBUG") == "1":
+            log("mode -> %s" % self.mode)
+
+    def _switch_mode(self):
+        """
+        标准 <-> 小窗的布局重排：
+        - 收缩态（左右圆环条 / 顶部小条）只换内容，几何不动；
+        - 展开态按新尺寸重设几何，以窗口中心为锚点，保证不跳出屏幕。
+        """
+        s = self.s
+        if self.docked is not None and not self.hover_expanded:
+            self._relayout()
+            return
+        cur_w = self.root.winfo_width() or s(COMPACT_W)
+        cur_h = self.root.winfo_height() or s(COMPACT_H)
+        cx = self.root.winfo_x() + cur_w // 2
+        cy = self.root.winfo_y() + cur_h // 2
+        px_w, px_h = self._panel_px_size()
+        if self.docked is not None:
+            x, y = self._dock_anchor(self.docked, px_w, px_h, cx, cy)
+        else:
+            x, y = self._clamp_pos(cx - px_w // 2, cy - px_h // 2, px_w, px_h)
+        self.root.geometry("%dx%d+%d+%d" % (px_w, px_h, x, y))
+        self._relayout()
+        self._raise_window()
+
+    # -- 屏幕坐标 / 拖动边界 -------------------------------------------------
+    def _virtual_screen(self):
+        """
+        虚拟屏（多显示器合并后的桌面）范围，返回 (x0, y0, width, height)。
+
+        用 GetSystemMetrics(SM_XVIRTUALSCREEN 等) 取真实值——副屏在主屏左侧 /
+        上方时原点是负数，所以不能用主屏尺寸或 0 硬限制。
+        """
+        if _user32 is not None:
+            try:
+                x0 = int(_user32.GetSystemMetrics(76))   # SM_XVIRTUALSCREEN
+                y0 = int(_user32.GetSystemMetrics(77))   # SM_YVIRTUALSCREEN
+                w = int(_user32.GetSystemMetrics(78))    # SM_CXVIRTUALSCREEN
+                h = int(_user32.GetSystemMetrics(79))    # SM_CYVIRTUALSCREEN
+                if w > 0 and h > 0:
+                    return x0, y0, w, h
+            except Exception:
+                pass
+        try:                                              # 兜底：Tk 虚拟根窗口
+            x0 = int(self.root.winfo_vrootx())
+            y0 = int(self.root.winfo_vrooty())
+            w = int(self.root.winfo_vrootwidth())
+            h = int(self.root.winfo_vrootheight())
+        except Exception:
+            x0 = y0 = 0
+            w = int(self.root.winfo_screenwidth())
+            h = int(self.root.winfo_screenheight())
+        if w <= 0 or h <= 0:
+            x0 = y0 = 0
+            w = int(self.root.winfo_screenwidth())
+            h = int(self.root.winfo_screenheight())
+        return x0, y0, w, h
+
     def _screen_edges(self):
-        """虚拟屏（多显示器合并后的桌面）左右边界。"""
-        try:
-            left = self.root.winfo_vrootx()
-            width = self.root.winfo_vrootwidth()
-        except tk.TclError:
-            left = 0
-            width = self.root.winfo_screenwidth()
-        return left, left + width
+        """虚拟屏左右边界 (left, right)。"""
+        x0, _y0, vw, _vh = self._virtual_screen()
+        return x0, x0 + vw
+
+    def _clamp_pos(self, x, y, px_w, px_h):
+        """
+        把窗口位置限制在虚拟屏内：左边 / 上边不越界（到边缘即停），
+        右边 / 下边同样不许超出——拖到哪一边都会被挡住。
+        """
+        vx0, vy0, vw, vh = self._virtual_screen()
+        x = int(round(x))
+        y = int(round(y))
+        if px_w < vw:
+            x = max(vx0, min(x, vx0 + vw - px_w))
+        else:
+            x = vx0
+        if px_h < vh:
+            y = max(vy0, min(y, vy0 + vh - px_h))
+        else:
+            y = vy0
+        return x, y
 
     def _clamp_y(self, center_y, px_h):
-        return max(0, min(int(center_y - px_h // 2), self.root.winfo_screenheight() - px_h))
+        """按窗口中心的 y 把窗口钳制在虚拟屏内。"""
+        vx0, vy0, vw, vh = self._virtual_screen()
+        top = int(center_y - px_h // 2)
+        return max(vy0, min(top, vy0 + vh - px_h))
+
+    # -- 各形态的窗口尺寸（逻辑 -> 物理像素） --------------------------------
+    def _panel_px_size(self):
+        """展开态（完整面板 / 小窗模式）的窗口像素尺寸。"""
+        if self.compact:
+            return self.s(COMPACT_W), self.s(COMPACT_H)
+        return self.s(self.width), self.s(H)
+
+    def _dock_px_size(self, side):
+        """收缩态的窗口像素尺寸：左右 = 圆环条，上边 = 顶部小条。"""
+        if side == "top":
+            return self.s(COMPACT_W), self.s(COMPACT_H)
+        return self.s(EDGE_W), self.s(EDGE_H)
+
+    def _dock_anchor(self, side, px_w, px_h, center_x, center_y):
+        """
+        计算吸附后的窗口坐标。
+        left/right 用屏幕边缘锚定；top 贴住虚拟屏上边缘、水平方向保持原中心。
+        """
+        vx0, vy0, vw, vh = self._virtual_screen()
+        if side == "left":
+            x = vx0
+        elif side == "right":
+            x = vx0 + vw - px_w
+        else:   # top：水平保持原中心，不跳到别处
+            x, _ = self._clamp_pos(center_x - px_w // 2, vy0, px_w, px_h)
+        if side == "top":
+            y = vy0
+        else:
+            y = self._clamp_y(center_y, px_h)
+        return x, y
 
     def _maybe_dock(self):
-        """拖动松手：距屏幕左右边缘 8px 内吸附收缩，拖离则恢复正常宽度。"""
+        """
+        拖动松手时的吸附判定，顺序 **上 -> 左 -> 右（上边优先）**。
+        命中边缘则收缩；已吸附但被拖离则恢复正常尺寸。
+        """
         if not self.edge_dock:
             if self.docked is not None:
                 self._undock()
             return
         x0, x1 = self._screen_edges()
+        _vx0, vy0, _vw, _vh = self._virtual_screen()
         x = self.root.winfo_x()
+        y = self.root.winfo_y()
         w = self.root.winfo_width()
         thr = max(self.s(EDGE_THRESHOLD), 4)
-        left_gap = x - x0
-        right_gap = x1 - (x + w)
-        if -thr <= left_gap <= thr:
+        if -thr <= (y - vy0) <= thr:          # 上边优先
+            self._dock("top")
+            return
+        if -thr <= (x - x0) <= thr:           # 左边
             self._dock("left")
             return
-        if -thr <= right_gap <= thr:
+        if -thr <= (x1 - (x + w)) <= thr:     # 右边
             self._dock("right")
             return
         if self.docked is not None:
             self._undock()
 
     def _dock(self, side):
-        """吸附到屏幕 left/right 边并收缩成圆环条（以当前窗口中心为锚点）。"""
+        """吸附到屏幕边缘并收缩：左右 = 36px 圆环条，上边 = 顶部悬浮小条。"""
         if self.docked == side and not self.hover_expanded:
             return
-        s = self.s
-        px_w, px_h = s(EDGE_W), s(EDGE_H)
-        cur_w = self.root.winfo_width() or s(self.width)
-        cur_h = self.root.winfo_height() or s(H)
+        cur_w = self.root.winfo_width() or self.s(self.width)
+        cur_h = self.root.winfo_height() or self.s(H)
+        cx = self.root.winfo_x() + cur_w // 2
         cy = self.root.winfo_y() + cur_h // 2
-        x0, x1 = self._screen_edges()
-        x = x0 if side == "left" else x1 - px_w
-        y = self._clamp_y(cy, px_h)
+        px_w, px_h = self._dock_px_size(side)
+        x, y = self._dock_anchor(side, px_w, px_h, cx, cy)
         self.docked = side
         self.hover_expanded = False
-        self.hover_armed = False       # 松手时指针还在圆环上，别立刻弹开
+        self.hover_armed = False       # 松手时指针还在收缩条上，别立刻弹开
         self.leave_deadline = None
-        self._layout_dock()
+        self._relayout()
         self.root.geometry("%dx%d+%d+%d" % (px_w, px_h, x, y))
         self._raise_window()
         if os.environ.get("OPENCODE_WIDGET_DEBUG") == "1":
             log("dock %s -> %d,%d %dx%d" % (side, x, y, px_w, px_h))
 
     def _expand_dock(self):
-        """悬停圆环条：完整三行面板从边缘滑出（贴边锚点不变）。"""
+        """悬停收缩条：面板从边缘滑出（贴边锚点不变），上边展开成当前模式的完整面板。"""
         if self.docked is None or self.hover_expanded:
             return
-        s = self.s
-        px_w, px_h = s(self.width), s(H)
-        cur_h = self.root.winfo_height() or s(EDGE_H)
+        px_w, px_h = self._panel_px_size()
+        cur_w = self.root.winfo_width() or px_w
+        cur_h = self.root.winfo_height() or px_h
+        cx = self.root.winfo_x() + cur_w // 2
         cy = self.root.winfo_y() + cur_h // 2
-        x0, x1 = self._screen_edges()
-        x = x0 if self.docked == "left" else x1 - px_w
-        y = self._clamp_y(cy, px_h)
+        x, y = self._dock_anchor(self.docked, px_w, px_h, cx, cy)
         self.hover_expanded = True
         self.leave_deadline = None
-        self._layout_panel()
+        self._relayout()
         self.root.geometry("%dx%d+%d+%d" % (px_w, px_h, x, y))
         self._raise_window()
         if os.environ.get("OPENCODE_WIDGET_DEBUG") == "1":
-            log("expand dock -> %d,%d %dx%d" % (x, y, px_w, px_h))
+            log("expand dock %s -> %d,%d %dx%d" % (self.docked, x, y, px_w, px_h))
 
     def _collapse_dock(self):
-        """鼠标离开 800ms 后（或程序性收回）把面板收回边缘成圆环条。"""
+        """鼠标离开 800ms 后（或程序性收回）把面板收回边缘。"""
         if self.docked is None or not self.hover_expanded:
             return
-        s = self.s
-        px_w, px_h = s(EDGE_W), s(EDGE_H)
-        cur_w = self.root.winfo_width() or s(self.width)
-        cur_h = self.root.winfo_height() or s(H)
+        side = self.docked
+        px_w, px_h = self._dock_px_size(side)
+        cur_w = self.root.winfo_width() or px_w
+        cur_h = self.root.winfo_height() or px_h
         cx = self.root.winfo_x() + cur_w // 2
         cy = self.root.winfo_y() + cur_h // 2
-        x0, x1 = self._screen_edges()
-        x = x0 if self.docked == "left" else x1 - px_w
-        y = self._clamp_y(cy, px_h)
+        x, y = self._dock_anchor(side, px_w, px_h, cx, cy)
         self.hover_expanded = False
         self.hover_armed = False
         self.leave_deadline = None
-        self._layout_dock()
+        self._relayout()
         self.root.geometry("%dx%d+%d+%d" % (px_w, px_h, x, y))
         if os.environ.get("OPENCODE_WIDGET_DEBUG") == "1":
-            log("collapse dock -> %d,%d %dx%d" % (x, y, px_w, px_h))
+            log("collapse dock %s -> %d,%d %dx%d" % (side, x, y, px_w, px_h))
 
     def _undock(self):
-        """拖离边缘：恢复正常宽度，窗口中心保持不动（刚好在鼠标下方）。"""
+        """拖离边缘：恢复正常尺寸，窗口中心保持不动（刚好在鼠标下方）。"""
         if self.docked is None:
             return
-        s = self.s
-        px_w, px_h = s(self.width), s(H)
-        cur_w = self.root.winfo_width() or s(EDGE_W)
-        cur_h = self.root.winfo_height() or s(EDGE_H)
+        px_w, px_h = self._panel_px_size()
+        cur_w = self.root.winfo_width() or px_w
+        cur_h = self.root.winfo_height() or px_h
         cx = self.root.winfo_x() + cur_w // 2
         cy = self.root.winfo_y() + cur_h // 2
-        x0, x1 = self._screen_edges()
-        x = max(x0, min(int(cx - px_w // 2), x1 - px_w))
-        y = self._clamp_y(cy, px_h)
+        x, y = self._clamp_pos(cx - px_w // 2, cy - px_h // 2, px_w, px_h)
         self.docked = None
         self.hover_expanded = False
         self.hover_armed = True
         self.leave_deadline = None
-        self._layout_panel()
+        self._relayout()
         self.root.geometry("%dx%d+%d+%d" % (px_w, px_h, x, y))
         self._raise_window()
         if os.environ.get("OPENCODE_WIDGET_DEBUG") == "1":
@@ -1692,14 +2018,10 @@ class Widget:
             )
         else:
             text, color = "…", C_SUB
-        # 文字按可用内径自适应字号，保证 “100%” 也不会撑出圆环
-        inner = 2 * r - stroke - s(2)
-        font = _FONTS["ring_xs"]
-        for name in ("ring", "ring_sm", "ring_xs"):
-            font = _FONTS[name]
-            if font.measure(text) <= inner:
-                break
-        canvas.create_text(cx, cy, text=text, font=font, fill=color)
+        canvas.create_text(
+            cx, cy, text=text, font=self._fit_ring_font(text, 2 * r - stroke - s(2)),
+            fill=color,
+        )
 
     # -- 系统托盘 -----------------------------------------------------------
     def _create_tray(self):
@@ -1838,7 +2160,8 @@ class Widget:
                 self.ring_used = rolling["percent"]
             else:
                 self.ring_state = "error"
-        self._draw_ring()           # 收缩态下圆环立刻跟上最新数据 / 错误态
+        self._draw_ring()           # 左右圆环条立刻跟上最新数据 / 错误态
+        self._draw_compact()        # 小窗模式 / 顶部小条的三段横条同样刷新
         if self.tray is not None:
             self.tray.set_tip(self._tooltip_text(payload))   # 只改 szTip，不重建图标
         self.busy = False
